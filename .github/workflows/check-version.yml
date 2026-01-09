@@ -1,0 +1,99 @@
+name: Check Upstream and Build
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: "pressly/goose"
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: 1. Fetch Latest Tag from Upstream
+        id: get_tag
+        run: |
+          # Fetch the latest tag name using GitHub API
+          LATEST_TAG=$(curl -s "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/tags" | jq -r '.[0].name')
+          
+          if [ "$LATEST_TAG" == "null" ] || [ -z "$LATEST_TAG" ]; then
+            echo "Error: Could not fetch tags from upstream."
+            exit 1
+          fi
+
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest upstream tag found: $LATEST_TAG"
+
+      - name: 2. Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 3. Check if Image Tag Exists in GHCR
+        id: check_ghcr
+        run: |
+          # GHCR image names must be lowercase
+          LOWER_IMAGE_NAME=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          TAG="${{ steps.get_tag.outputs.tag }}"
+          
+          echo "Checking for: ${LOWER_IMAGE_NAME}:${TAG}"
+          
+          # Use docker manifest inspect to check remote existence without pulling
+          if docker manifest inspect ${LOWER_IMAGE_NAME}:${TAG} > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Result: Tag $TAG already exists in GHCR. Skipping build."
+            exit 0
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Result: Tag $TAG is missing. Proceeding to build."
+          fi
+
+      - name: 4. Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Metadata Action
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+            ${{ secrets.DOCKER_HUB_USERNAME }}/goose
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: 5. Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/386,linux/arm64,linux/arm/v7,linux/ppc64le,linux/riscv64
+          build-args: |
+            GOOSE_VERSION=${{ steps.get_tag.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
